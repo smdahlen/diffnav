@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 
 	"charm.land/bubbles/v2/key"
@@ -11,6 +12,7 @@ import (
 	"charm.land/lipgloss/v2"
 	"charm.land/log/v2"
 	"github.com/bluekeyes/go-gitdiff/gitdiff"
+	"github.com/mattn/go-runewidth"
 
 	"github.com/dlvhdr/diffnav/pkg/filenode"
 	"github.com/dlvhdr/diffnav/pkg/icons"
@@ -33,9 +35,12 @@ type cachedNode struct {
 
 type nodeCache map[string]*cachedNode
 
-func cacheKey(path string, sideBySide bool) string {
+func cacheKey(path string, sideBySide bool, wrapText bool) string {
 	if sideBySide {
-		return path + ":sbs"
+		path += ":sbs"
+	}
+	if wrapText {
+		path += ":wrap"
 	}
 	return path
 }
@@ -90,6 +95,7 @@ type Model struct {
 	dir        *cachedNode
 	cache      nodeCache
 	sideBySide bool
+	wrapText   bool
 	preamble   string
 	sb         common.Scrollbar
 }
@@ -99,7 +105,7 @@ func (m *Model) SetPreamble(preamble string) {
 	m.preamble = preamble
 }
 
-func New(sideBySide bool) Model {
+func New(sideBySide bool, wrapText bool) Model {
 	sb := common.Scrollbar{
 		Styles: common.ScrollbarStyles{
 			Thumb: lipgloss.NewStyle().Foreground(lipgloss.Blue),
@@ -147,7 +153,7 @@ func New(sideBySide bool) Model {
 		Background(lipgloss.Color("#3D59A1")).
 		Foreground(lipgloss.White)
 
-	return Model{
+	m := Model{
 		sb: sb,
 		fvp: filterableviewport.New(
 			vp,
@@ -195,8 +201,10 @@ func New(sideBySide bool) Model {
 			filterableviewport.WithHorizontalPad[diffLine](8),
 		),
 		sideBySide: sideBySide,
+		wrapText:   wrapText,
 		cache:      map[string]*cachedNode{},
 	}
+	return m
 }
 
 func (m Model) Init() tea.Cmd {
@@ -254,7 +262,7 @@ func (m Model) contentWidth() int {
 
 func (m *Model) diff() tea.Cmd {
 	if m.file != nil {
-		key := cacheKey(m.file.path, m.sideBySide)
+		key := cacheKey(m.file.path, m.sideBySide, m.wrapText)
 		if cached, ok := m.cache[key]; ok && len(cached.diff) != 0 {
 			m.file = cached
 			m.fvp.SetObjects(cached.diff)
@@ -268,9 +276,9 @@ func (m *Model) diff() tea.Cmd {
 		}
 		m.file = node
 		m.cache[key] = node
-		return diffFile(node, m.contentWidth(), m.sideBySide)
+		return diffFile(node, m.contentWidth(), m.sideBySide, m.wrapText)
 	} else if m.dir != nil {
-		key := cacheKey(m.dir.path, m.sideBySide)
+		key := cacheKey(m.dir.path, m.sideBySide, m.wrapText)
 		if cached, ok := m.cache[key]; ok && len(cached.diff) != 0 {
 			m.dir = cached
 			m.fvp.SetObjects(cached.diff)
@@ -288,7 +296,7 @@ func (m *Model) diff() tea.Cmd {
 		if m.dir.path == "/" {
 			preamble = m.preamble
 		}
-		return diffDir(node, m.contentWidth(), m.sideBySide, preamble)
+		return diffDir(node, m.contentWidth(), m.sideBySide, m.wrapText, preamble)
 	}
 
 	return nil
@@ -341,7 +349,7 @@ func (m Model) SetFilePatch(file *gitdiff.File) (Model, tea.Cmd) {
 	m.dir = nil
 
 	fname := filenode.GetFileName(file)
-	key := cacheKey(fname, m.sideBySide)
+	key := cacheKey(fname, m.sideBySide, m.wrapText)
 	if cached, ok := m.cache[key]; ok {
 		m.file = cached
 		m.fvp.SetObjects(cached.diff)
@@ -359,13 +367,13 @@ func (m Model) SetFilePatch(file *gitdiff.File) (Model, tea.Cmd) {
 	}
 	m.cache[key] = m.file
 
-	return m, diffFile(m.file, m.contentWidth(), m.sideBySide)
+	return m, diffFile(m.file, m.contentWidth(), m.sideBySide, m.wrapText)
 }
 
 func (m Model) SetDirPatch(dirPath string, files []*gitdiff.File) (Model, tea.Cmd) {
 	m.file = nil
 
-	key := cacheKey(dirPath, m.sideBySide)
+	key := cacheKey(dirPath, m.sideBySide, m.wrapText)
 	if cached, ok := m.cache[key]; ok {
 		m.dir = cached
 		m.fvp.SetObjects(cached.diff)
@@ -389,13 +397,22 @@ func (m Model) SetDirPatch(dirPath string, files []*gitdiff.File) (Model, tea.Cm
 	if dirPath == "/" {
 		preamble = m.preamble
 	}
-	return m, diffDir(m.dir, m.contentWidth(), m.sideBySide, preamble)
+	return m, diffDir(m.dir, m.contentWidth(), m.sideBySide, m.wrapText, preamble)
 }
 
 // SetSideBySide updates the diff view mode and re-renders.
 func (m *Model) SetSideBySide(sideBySide bool) tea.Cmd {
 	m.sideBySide = sideBySide
 	return m.diff()
+}
+
+func (m *Model) ToggleWrapText() tea.Cmd {
+	m.wrapText = !m.wrapText
+	return m.diff()
+}
+
+func (m *Model) GetWrapText() bool {
+	return m.wrapText
 }
 
 // ScrollUp scrolls the viewport up by the given number of lines.
@@ -428,13 +445,13 @@ func (m *Model) ScrollRight(cols int) {
 	m.fvp.ScrollRight(cols)
 }
 
-func diffFile(node *cachedNode, width int, sideBySide bool) tea.Cmd {
+func diffFile(node *cachedNode, width int, sideBySide bool, wrapText bool) tea.Cmd {
 	if width == 0 || node == nil || len(node.files) != 1 {
 		return nil
 	}
 
 	file := node.files[0]
-	key := cacheKey(node.path, sideBySide)
+	key := cacheKey(node.path, sideBySide, wrapText)
 	return func() tea.Msg {
 		// Only use side-by-side if preference is true AND file is not new/deleted
 		useSideBySide := sideBySide && !file.IsNew && !file.IsDelete
@@ -461,15 +478,15 @@ func diffFile(node *cachedNode, width int, sideBySide bool) tea.Cmd {
 			return common.ErrMsg{Err: err}
 		}
 
-		return diffContentMsg{cacheKey: key, lines: stringToDiffLines(string(out))}
+		return diffContentMsg{cacheKey: key, lines: stringToDiffLines(string(out), width, wrapText)}
 	}
 }
 
-func diffDir(dir *cachedNode, width int, sideBySide bool, preamble string) tea.Cmd {
+func diffDir(dir *cachedNode, width int, sideBySide bool, wrapText bool, preamble string) tea.Cmd {
 	if width == 0 || dir == nil {
 		return nil
 	}
-	key := cacheKey(dir.path, sideBySide)
+	key := cacheKey(dir.path, sideBySide, wrapText)
 	return func() tea.Msg {
 		s := common.BgStyles[common.Selected]
 		c := common.LipglossColorToHex(common.Colors[common.Selected])
@@ -508,7 +525,7 @@ func diffDir(dir *cachedNode, width int, sideBySide bool, preamble string) tea.C
 		if preamble != "" {
 			text = renderPreamble(preamble) + "\n" + text
 		}
-		return diffContentMsg{cacheKey: key, lines: stringToDiffLines(text)}
+		return diffContentMsg{cacheKey: key, lines: stringToDiffLines(text, width, wrapText)}
 	}
 }
 
@@ -554,7 +571,7 @@ func (m *Model) ClearCache() {
 }
 
 func (m *Model) RootDiffStats() (int64, int64) {
-	if item, ok := m.cache[cacheKey("/", m.sideBySide)]; ok {
+	if item, ok := m.cache[cacheKey("/", m.sideBySide, m.wrapText)]; ok {
 		return item.additions, item.deletions
 	}
 
@@ -587,11 +604,100 @@ func (m *Model) SetSelectionEnabled(val bool) {
 	m.fvp.SetSelectionEnabled(val)
 }
 
-func stringToDiffLines(val string) []diffLine {
+// deltaGutter matches the line-number gutter delta prefixes each diff line
+// with, e.g. "  12 \u22ee  12 \u2502". Continuation rows are indented by its width so
+// wrapped text stays in the content column instead of running back under the
+// line numbers.
+var deltaGutter = regexp.MustCompile(`^ *[0-9]* *\x{22ee} *[0-9]* *\x{2502}`)
+
+// deltaFill matches the trailing sequence delta uses to run a line's background
+// out to the edge of the pane: reset, set background, erase to end of line.
+// Added and removed lines carry it, context lines do not. Each wrapped row needs
+// its own copy or only the rows that happen to fill the width stay coloured.
+var deltaFill = regexp.MustCompile("\x1b\\[0m\x1b\\[[0-9;]*m\x1b\\[0K\x1b\\[0m$")
+
+func stringToDiffLines(val string, width int, wrapText bool) []diffLine {
 	lines := strings.Split(val, "\n")
-	objects := make([]diffLine, len(lines))
-	for i, line := range lines {
-		objects[i] = diffLine{item: item.NewItem(line)}
+	objects := make([]diffLine, 0, len(lines))
+	for _, line := range lines {
+		objects = append(objects, wrapDiffLine(line, width, wrapText)...)
 	}
 	return objects
+}
+
+func wrapDiffLine(line string, width int, wrapText bool) []diffLine {
+	it := item.NewItem(line)
+	if !wrapText || width <= 0 || it.Width() <= width {
+		return []diffLine{{item: it}}
+	}
+
+	fill := deltaFill.FindString(line)
+	if fill != "" {
+		line = strings.TrimSuffix(line, fill)
+		it = item.NewItem(line)
+	}
+
+	plain := it.ContentNoAnsi()
+	prefix := deltaGutter.FindString(plain)
+	gutter := runewidth.StringWidth(prefix)
+	avail := width - gutter
+	if avail <= 0 {
+		prefix, gutter, avail = "", 0, width
+	}
+
+	widths := wrapWidths(plain[len(prefix):], avail)
+	if len(widths) == 0 {
+		return []diffLine{{item: it}}
+	}
+
+	first, _ := it.Take(0, gutter+widths[0], "", nil)
+	wrapped := []diffLine{{item: item.NewItem(first + fill)}}
+
+	pad := strings.Repeat(" ", gutter)
+	taken := gutter + widths[0]
+	for _, w := range widths[1:] {
+		rest, _ := it.Take(taken, w, "", nil)
+		wrapped = append(wrapped, diffLine{item: item.NewItem(pad + rest + fill)})
+		taken += w
+	}
+	return wrapped
+}
+
+// wrapWidths splits s into consecutive runs no wider than limit, breaking after
+// a space where one is available so prose does not break mid-word. A word wider
+// than limit is broken at the limit.
+func wrapWidths(s string, limit int) []int {
+	if limit <= 0 {
+		return nil
+	}
+
+	var (
+		widths    []int
+		row       int
+		breakAt   = -1
+		afterSpce int
+	)
+	for _, r := range s {
+		w := runewidth.RuneWidth(r)
+		if row+w > limit && row > 0 {
+			if breakAt > 0 {
+				widths = append(widths, breakAt)
+				row = afterSpce
+			} else {
+				widths = append(widths, row)
+				row = 0
+			}
+			breakAt, afterSpce = -1, 0
+		}
+		row += w
+		if r == ' ' {
+			breakAt, afterSpce = row, 0
+		} else {
+			afterSpce += w
+		}
+	}
+	if row > 0 {
+		widths = append(widths, row)
+	}
+	return widths
 }
